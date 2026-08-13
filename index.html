@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Tracker</title>
+  <meta name="description" content="Offline-first calorie and workout tracker" />
+
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#14181C" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+  <!-- Compiled Tailwind build (see /vendor/README.md) -- no CDN dependency,
+       so styling works fully offline after the first load. -->
+  <link rel="stylesheet" href="vendor/tailwind.css" />
+
+  <style>
+    /* Minimal pre-boot styles so there's no unstyled flash before app.js mounts. */
+    html, body { background: #14181C; margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="app-shell" class="max-w-sm mx-auto min-h-screen">
+    <header class="sticky top-0 z-40 bg-[#14181C]/95 backdrop-blur px-4 pt-4 pb-2 border-b border-white/5">
+      <div class="flex items-center justify-between">
+        <nav class="flex gap-2" role="tablist" aria-label="View">
+          <button type="button" data-tab="dashboard"
+            class="text-xs font-medium rounded-full px-3 py-1.5 bg-[#D9A441] text-[#14181C]">Dashboard</button>
+          <button type="button" data-tab="log"
+            class="text-xs font-medium rounded-full px-3 py-1.5 text-[#9AA2A8]">Log entry</button>
+        </nav>
+        <div class="flex items-center gap-2">
+          <button type="button" id="export-btn" title="Export all data as JSON"
+            class="text-xs rounded-full border border-white/10 px-3 py-1.5 text-[#9AA2A8]">Export</button>
+          <label for="import-input" title="Restore from a JSON backup"
+            class="text-xs rounded-full border border-white/10 px-3 py-1.5 text-[#9AA2A8] cursor-pointer">
+            Import
+            <input type="file" id="import-input" accept="application/json" class="hidden" />
+          </label>
+        </div>
+      </div>
+      <p id="backup-status" class="text-[10px] font-mono text-[#9AA2A8] mt-1.5 min-h-[1em]"></p>
+    </header>
+
+    <main>
+      <div id="dashboard-root"></div>
+      <div id="log-root" class="hidden"></div>
+    </main>
+  </div>
+
+  <!-- Vendored libraries (self-hosted, no CDN) -->
+  <script src="vendor/dexie.js"></script>
+  <script src="vendor/fuse.min.js"></script>
+
+  <!-- Database schema + seed data (plain script, attaches window.db / window.dbReady) -->
+  <script src="js/db-setup.js"></script>
+
+  <!-- App modules (ES modules; app.js pulls in parser.js/dashboard.js/override-modal.js/backup.js via imports) -->
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
