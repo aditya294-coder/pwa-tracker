@@ -142,6 +142,23 @@ function deriveTargetDeficit(goal) {
   return GOAL_DEFICITS[goal] != null ? GOAL_DEFICITS[goal] : 0;
 }
 
+/**
+ * Smart-default macro split, used whenever a profile doesn't have explicit
+ * protein_target_g / carb_target_g / fat_target_g set (e.g. profiles saved
+ * before macro targets existed, or a first-run save where the user left
+ * these fields blank). Protein and fat are set per kg of bodyweight
+ * (1.6 g/kg and 0.8 g/kg -- reasonable general-fitness defaults, not
+ * medical advice), and carbs fill whatever calorie budget is left.
+ */
+function computeSuggestedMacros({ weight, tdee, target_deficit, proteinPerKg = 1.6 }) {
+  const dailyTarget = Math.max(tdee - target_deficit, 0);
+  const proteinG = round(weight * proteinPerKg);
+  const fatG = round(weight * 0.8);
+  const remainingCals = Math.max(dailyTarget - proteinG * 4 - fatG * 9, 0);
+  const carbG = round(remainingCals / 4);
+  return { proteinG, carbG, fatG };
+}
+
 function isProfileComplete(profile) {
   return !!(
     profile &&
@@ -157,6 +174,16 @@ function isProfileComplete(profile) {
 function round(n, decimals = 0) {
   const factor = 10 ** decimals;
   return Math.round(n * factor) / factor;
+}
+
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // =========================================================================
@@ -209,16 +236,18 @@ async function saveProfile(db, profile) {
 }
 
 /**
- * Sums today's logged food/workout entries and computes the full energy
- * picture for one calendar day, then upserts daily_logs so the rollup is
+ * Sums the selected day's logged food/workout entries and computes the full
+ * energy + macro picture, then upserts daily_logs so the rollup is
  * persisted (self-healing: recomputed from entry_items every time it's
- * viewed, so it's always in sync even if entries were edited after the fact).
+ * viewed, so it's always in sync even if entries were added/edited/deleted).
  */
 async function computeDaySummary(db, dateKey, profile, { proteinPerKg = 1.6, activeBurnGoal = 300 } = {}) {
   const entries = await db.entry_items.where('date').equals(dateKey).toArray();
 
   const caloriesIn = round(sumBy(entries, (e) => (e.type === 'food' ? e.calories : 0)));
   const proteinIn = round(sumBy(entries, (e) => (e.type === 'food' ? e.protein : 0)), 1);
+  const carbsIn = round(sumBy(entries, (e) => (e.type === 'food' ? e.carbs : 0)), 1);
+  const fatIn = round(sumBy(entries, (e) => (e.type === 'food' ? e.fat : 0)), 1);
   const workoutBurn = round(sumBy(entries, (e) => (e.type === 'workout' ? e.calories : 0)));
 
   const bmr = calculateBMR(profile);
@@ -229,20 +258,40 @@ async function computeDaySummary(db, dateKey, profile, { proteinPerKg = 1.6, act
   const goalNet = -profile.target_deficit; // e.g. -500 for a 500kcal/day deficit goal
   const deltaFromGoal = round(netCalories - goalNet); // <=0 means on/ahead of goal
 
-  const proteinTarget = round(profile.weight * proteinPerKg);
+  // Macro targets: use the profile's explicit values if set, otherwise fall
+  // back to a computed smart default (covers profiles saved before macro
+  // targets existed, and first-run saves where the fields were left blank).
+  const macroDefaults = computeSuggestedMacros({ weight: profile.weight, tdee, target_deficit: profile.target_deficit, proteinPerKg });
+  const proteinTarget = profile.protein_target_g != null ? profile.protein_target_g : macroDefaults.proteinG;
+  const carbTarget = profile.carb_target_g != null ? profile.carb_target_g : macroDefaults.carbG;
+  const fatTarget = profile.fat_target_g != null ? profile.fat_target_g : macroDefaults.fatG;
+
+  // Bug fix: only "today" should track the live profile weight. Viewing a
+  // past date used to silently overwrite that day's recorded weight with
+  // whatever your CURRENT weight is -- wiping out real weight history every
+  // time you scrolled back. Historical days now keep whatever was already
+  // stored for them.
+  let profileWeightForDay = profile.weight;
+  if (dateKey !== toDateKey(new Date())) {
+    const existing = await db.daily_logs.get(dateKey);
+    if (existing && existing.profile_weight != null) profileWeightForDay = existing.profile_weight;
+  }
 
   await db.daily_logs.put({
     date: dateKey,
     calories_in: caloriesIn,
     calories_out: totalOutput,
     net_calories: netCalories,
-    profile_weight: profile.weight,
+    profile_weight: profileWeightForDay,
   });
 
   return {
     dateKey,
+    entries,
     caloriesIn,
     proteinIn,
+    carbsIn,
+    fatIn,
     workoutBurn,
     bmr,
     tdee,
@@ -252,6 +301,8 @@ async function computeDaySummary(db, dateKey, profile, { proteinPerKg = 1.6, act
     goalNet,
     deltaFromGoal,
     proteinTarget,
+    carbTarget,
+    fatTarget,
     activeBurnGoal,
   };
 }
@@ -318,12 +369,33 @@ function renderModalMarkup(existingProfile) {
         </select>
       </label>
 
-      <label class="block mb-6">
+      <label class="block mb-4">
         <span class="text-xs uppercase tracking-wide text-[var(--db-muted)] db-font-mono">Goal</span>
         <select required name="goal" class="db-focusable mt-1 w-full rounded-xl bg-[var(--db-surface-2)] border border-white/10 px-3 py-2.5 text-base">
           ${goalOptions}
         </select>
       </label>
+
+      <div class="mb-6">
+        <p class="text-xs uppercase tracking-wide text-[var(--db-muted)] db-font-mono mb-2">Daily macro targets (optional -- leave blank for a smart default)</p>
+        <div class="grid grid-cols-3 gap-2.5">
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wide text-[var(--db-muted)] db-font-mono">Protein (g)</span>
+            <input type="number" step="1" min="0" name="protein_target_g" value="${p.protein_target_g ?? ''}" placeholder="auto"
+              class="db-focusable mt-1 w-full rounded-lg bg-[var(--db-surface-2)] border border-white/10 px-2 py-2 text-sm" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wide text-[var(--db-muted)] db-font-mono">Carbs (g)</span>
+            <input type="number" step="1" min="0" name="carb_target_g" value="${p.carb_target_g ?? ''}" placeholder="auto"
+              class="db-focusable mt-1 w-full rounded-lg bg-[var(--db-surface-2)] border border-white/10 px-2 py-2 text-sm" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wide text-[var(--db-muted)] db-font-mono">Fat (g)</span>
+            <input type="number" step="1" min="0" name="fat_target_g" value="${p.fat_target_g ?? ''}" placeholder="auto"
+              class="db-focusable mt-1 w-full rounded-lg bg-[var(--db-surface-2)] border border-white/10 px-2 py-2 text-sm" />
+          </label>
+        </div>
+      </div>
 
       <button type="submit" class="db-focusable w-full rounded-xl bg-[var(--db-gold)] text-[var(--db-ink)] font-semibold py-3.5 text-base active:scale-[0.98] transition-transform">
         Save and continue
@@ -336,6 +408,42 @@ function renderModalMarkup(existingProfile) {
 function deficitMatchesGoal(deficit, goal) {
   if (deficit == null) return goal === 'maintain' ? true : false;
   return GOAL_DEFICITS[goal] === deficit;
+}
+
+/**
+ * Live-updates the macro fields' placeholders as the user fills in
+ * age/sex/height/weight/activity/goal, so "auto" always previews the
+ * actual number it'll use rather than a static hint. Never touches the
+ * fields' typed values -- only what shows when they're empty.
+ */
+function wireLiveMacroSuggestions(formEl) {
+  const watch = ['age', 'sex', 'height', 'weight', 'activity_level', 'goal'];
+  const update = () => {
+    const age = Number(formEl.querySelector('[name="age"]').value);
+    const sex = formEl.querySelector('[name="sex"]').value;
+    const height = Number(formEl.querySelector('[name="height"]').value);
+    const weight = Number(formEl.querySelector('[name="weight"]').value);
+    const activity_level = formEl.querySelector('[name="activity_level"]').value;
+    const goal = formEl.querySelector('[name="goal"]').value;
+    if (!age || !height || !weight || !sex || !activity_level) return;
+
+    const bmr = calculateBMR({ sex, weight, height, age });
+    const tdee = calculateTDEE(bmr, activity_level);
+    const target_deficit = deriveTargetDeficit(goal);
+    const suggestion = computeSuggestedMacros({ weight, tdee, target_deficit });
+
+    const proteinInput = formEl.querySelector('[name="protein_target_g"]');
+    const carbInput = formEl.querySelector('[name="carb_target_g"]');
+    const fatInput = formEl.querySelector('[name="fat_target_g"]');
+    if (proteinInput) proteinInput.placeholder = `auto: ${suggestion.proteinG}`;
+    if (carbInput) carbInput.placeholder = `auto: ${suggestion.carbG}`;
+    if (fatInput) fatInput.placeholder = `auto: ${suggestion.fatG}`;
+  };
+  watch.forEach((name) => {
+    const el = formEl.querySelector(`[name="${name}"]`);
+    if (el) el.addEventListener('input', update);
+  });
+  update();
 }
 
 // =========================================================================
@@ -411,18 +519,86 @@ function renderStatPills(summary) {
   </div>`;
 }
 
-function renderProteinBar(summary) {
-  const fraction = summary.proteinTarget > 0 ? summary.proteinIn / summary.proteinTarget : 0;
+function renderMacroBar(label, colorVar, current, target) {
+  const safeTarget = target > 0 ? target : 0;
+  const fraction = safeTarget > 0 ? current / safeTarget : 0;
   const pct = Math.max(0, Math.min(100, round(fraction * 100)));
   return `
-  <div class="mt-4 rounded-2xl bg-[var(--db-surface)] p-3.5">
-    <div class="flex items-center justify-between text-[11px] db-font-mono uppercase tracking-wide text-[var(--db-indigo)]">
-      <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[var(--db-indigo)]"></span> Protein</span>
-      <span class="text-[var(--db-muted)] normal-case">${summary.proteinIn}g / ${summary.proteinTarget}g</span>
+  <div class="rounded-2xl bg-[var(--db-surface)] p-3.5">
+    <div class="flex items-center justify-between text-[11px] db-font-mono uppercase tracking-wide" style="color:${colorVar}">
+      <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full" style="background:${colorVar}"></span> ${label}</span>
+      <span class="text-[var(--db-muted)] normal-case">${round(current, 1)}g / ${round(safeTarget, 0)}g</span>
     </div>
     <div class="mt-2 h-2.5 rounded-full bg-[var(--db-track)] overflow-hidden">
-      <div class="h-full rounded-full db-ring-arc" style="width:${pct}%;background:var(--db-indigo);"></div>
+      <div class="h-full rounded-full db-ring-arc" style="width:${pct}%;background:${colorVar};"></div>
     </div>
+  </div>`;
+}
+
+// =========================================================================
+// 6b. RENDERING -- LOGGED ENTRIES (view + delete for the selected day)
+// =========================================================================
+
+function renderEntryList(entries) {
+  if (!entries.length) {
+    return `<p class="mt-4 text-xs db-font-mono text-[var(--db-muted)] text-center py-2">Nothing logged for this day yet.</p>`;
+  }
+  const rows = entries
+    .map(
+      (e) => `
+    <div class="flex items-center justify-between py-2 border-b border-white/5 last:border-0">
+      <div class="min-w-0 pr-2">
+        <div class="text-sm font-medium truncate">${e.type === 'workout' ? '🏋️' : '🍽️'} ${escapeHtml(e.matched_name || e.raw_text)}</div>
+        <div class="text-[10px] db-font-mono text-[var(--db-muted)] truncate">${escapeHtml(e.quantity || '')}</div>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <span class="db-font-mono text-xs">${round(e.calories, 0)} kcal</span>
+        <button type="button" data-db-delete-entry="${e.id}" aria-label="Delete entry" class="db-focusable text-[var(--db-muted)] hover:text-[var(--db-coral)] text-sm px-1">✕</button>
+      </div>
+    </div>`
+    )
+    .join('');
+  return `
+  <div class="mt-4 rounded-2xl bg-[var(--db-surface)] p-3.5">
+    <div class="text-[11px] db-font-mono uppercase tracking-wide text-[var(--db-muted)] mb-1">Logged entries</div>
+    ${rows}
+  </div>`;
+}
+
+// =========================================================================
+// 6c. RENDERING -- 7-DAY TREND (net calories vs. goal)
+// =========================================================================
+
+async function renderTrendMini(db, currentDateKey, goalNet) {
+  const days = [];
+  for (let i = 6; i >= 0; i -= 1) days.push(addDays(currentDateKey, -i));
+  const rows = await Promise.all(days.map((d) => db.daily_logs.get(d)));
+  const netValues = rows.map((r) => (r ? r.net_calories : null));
+  const maxAbs = Math.max(1, ...netValues.filter((v) => v != null).map((v) => Math.abs(v)), Math.abs(goalNet));
+
+  const bars = days
+    .map((d, idx) => {
+      const net = netValues[idx];
+      const hasData = net != null;
+      const heightPct = hasData ? Math.max(6, Math.min(100, round((Math.abs(net) / maxAbs) * 100))) : 4;
+      const onTrack = hasData && net <= goalNet;
+      const color = !hasData ? 'var(--db-track)' : onTrack ? 'var(--db-teal)' : 'var(--db-coral)';
+      const { weekday } = formatDayLabel(d);
+      const isCurrent = d === currentDateKey;
+      return `
+      <div class="flex-1 flex flex-col items-center gap-1">
+        <div class="w-full h-16 flex items-end">
+          <div class="w-full rounded-t-md ${isCurrent ? 'ring-1 ring-[var(--db-gold)]' : ''}" style="height:${heightPct}%;background:${color};"></div>
+        </div>
+        <span class="text-[9px] db-font-mono text-[var(--db-muted)]">${weekday[0]}</span>
+      </div>`;
+    })
+    .join('');
+
+  return `
+  <div class="mt-4 rounded-2xl bg-[var(--db-surface)] p-3.5">
+    <div class="text-[11px] db-font-mono uppercase tracking-wide text-[var(--db-muted)] mb-2">Last 7 days (net vs. goal)</div>
+    <div class="flex items-end gap-1.5">${bars}</div>
   </div>`;
 }
 
@@ -511,16 +687,34 @@ function mountDashboard(container, options = {}) {
   const dateNavEl = container.querySelector('[data-db-datenav]');
   const summaryEl = container.querySelector('[data-db-summary]');
 
+  // Delegated once -- summaryEl itself persists across renderSummary() calls
+  // even though its innerHTML is replaced each time.
+  summaryEl.addEventListener('click', async (e) => {
+    const delBtn = e.target.closest('[data-db-delete-entry]');
+    if (!delBtn) return;
+    const id = Number(delBtn.getAttribute('data-db-delete-entry'));
+    await db.entry_items.delete(id);
+    await renderSummary();
+  });
+
   async function renderSummary() {
     const summary = await computeDaySummary(db, state.currentDateKey, state.profile, {
       proteinPerKg,
       activeBurnGoal,
     });
 
+    const trendHtml = await renderTrendMini(db, state.currentDateKey, summary.goalNet);
+
     summaryEl.innerHTML = `
       ${renderEnergyRing(summary)}
       ${renderStatPills(summary)}
-      ${renderProteinBar(summary)}
+      <div class="mt-4 flex flex-col gap-2.5">
+        ${renderMacroBar('Protein', 'var(--db-indigo)', summary.proteinIn, summary.proteinTarget)}
+        ${renderMacroBar('Carbs', 'var(--db-gold)', summary.carbsIn, summary.carbTarget)}
+        ${renderMacroBar('Fat', 'var(--db-coral)', summary.fatIn, summary.fatTarget)}
+      </div>
+      ${trendHtml}
+      ${renderEntryList(summary.entries)}
     `;
     return summary;
   }
@@ -554,16 +748,39 @@ function mountDashboard(container, options = {}) {
     state.modalEl = modalEl;
 
     const form = modalEl.querySelector('[data-db-form]');
+    wireLiveMacroSuggestions(form);
+
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const data = new FormData(form);
+      const age = Number(data.get('age'));
+      const sex = data.get('sex');
+      const height = Number(data.get('height'));
+      const weight = Number(data.get('weight'));
+      const activity_level = data.get('activity_level');
+      const target_deficit = deriveTargetDeficit(data.get('goal'));
+
+      // Blank macro fields fall back to the computed smart default at the
+      // moment of saving (using whatever stats were just submitted), rather
+      // than an earlier live-preview value that might be stale.
+      const bmrNow = calculateBMR({ sex, weight, height, age });
+      const tdeeNow = calculateTDEE(bmrNow, activity_level);
+      const suggestion = computeSuggestedMacros({ weight, tdee: tdeeNow, target_deficit, proteinPerKg });
+
+      const proteinRaw = data.get('protein_target_g');
+      const carbRaw = data.get('carb_target_g');
+      const fatRaw = data.get('fat_target_g');
+
       const newProfile = {
-        age: Number(data.get('age')),
-        sex: data.get('sex'),
-        height: Number(data.get('height')),
-        weight: Number(data.get('weight')),
-        activity_level: data.get('activity_level'),
-        target_deficit: deriveTargetDeficit(data.get('goal')),
+        age,
+        sex,
+        height,
+        weight,
+        activity_level,
+        target_deficit,
+        protein_target_g: proteinRaw !== '' ? Number(proteinRaw) : suggestion.proteinG,
+        carb_target_g: carbRaw !== '' ? Number(carbRaw) : suggestion.carbG,
+        fat_target_g: fatRaw !== '' ? Number(fatRaw) : suggestion.fatG,
       };
       await saveProfile(db, newProfile);
       state.profile = newProfile;
@@ -631,3 +848,4 @@ export {
 if (typeof window !== 'undefined') {
   window.mountDashboard = mountDashboard;
 }
+
