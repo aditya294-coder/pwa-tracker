@@ -13,7 +13,7 @@
  * -----------------------------------------------------------------------
  */
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v3';
 const STATIC_CACHE = `tracker-static-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `tracker-runtime-${CACHE_VERSION}`;
 
