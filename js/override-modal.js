@@ -128,6 +128,13 @@ function debounce(fn, delay = 200) {
  * @param {(query:string, type:'food'|'workout') => Promise<Array>} [options.onlineSearch]
  *   Pluggable online lookup. Each result should look like a food_library or
  *   workout_library row. If omitted, the online-search control is disabled.
+ * @param {'auto'|'online'|'offline'} [options.parseMode='offline'] - forwarded
+ *   to parser.js's parseEntryText(). Defaults to 'offline' because this static
+ *   bundle has no backend at /api/parse-entry -- 'auto' would otherwise make a
+ *   network call that's guaranteed to fail on every single parse before
+ *   falling back, adding latency and console noise for no benefit. Switch to
+ *   'auto' once you've stood up a real backend proxy (see parser.js's header
+ *   comment for what that route needs to do).
  * @param {(summary: object) => void} [options.onSaved]
  * @returns {{ reset: Function, destroy: Function }}
  */
@@ -143,6 +150,7 @@ function mountOverrideModal(container, options = {}) {
     items: [], // review-state item objects, see makeItemState()
     userWeightKg: options.userWeightKg || null,
     profile: null,
+    parseMode: options.parseMode || 'offline',
   };
 
   container.innerHTML = `
@@ -444,7 +452,7 @@ function mountOverrideModal(container, options = {}) {
     try {
       await ensureProfile();
       const result = await parseEntryText(text, {
-        mode: 'auto',
+        mode: state.parseMode,
         userWeightKg: state.userWeightKg || 70,
       });
       const newItems = result.items.map(makeItemState);
@@ -750,3 +758,4 @@ export { mountOverrideModal };
 if (typeof window !== 'undefined') {
   window.mountOverrideModal = mountOverrideModal;
 }
+
